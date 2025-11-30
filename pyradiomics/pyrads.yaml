@@ -1,0 +1,67 @@
+# =============================================================================
+# RADIOMICS STANDARDIZATION CONFIGURATION (STEP 7: VERSION CONTROL)
+# =============================================================================
+# This YAML file locks all processing parameters to ensure deterministic,
+# reproducible feature extraction across platforms and datasets.
+#
+# Software versions (must be documented and locked):
+# - PyRadiomics: 3.1.0
+# - SimpleITK: 2.3.1
+# - NumPy: 1.26.4
+# - Python: 3.11
+#
+# Even minor version changes can alter numerical outputs due to differences in:
+# - Interpolation algorithms
+# - Floating-point rounding
+# - Matrix computation methods
+# =============================================================================
+
+setting:
+  # STEP 4: SPATIAL RESAMPLING
+  # Isotropic voxel spacing ensures texture features are computed over
+  # equivalent physical distances across all images
+  resampledPixelSpacing: [1.0, 1.0, 1.0]  # 1x1x1 mm isotropic
+  
+  # Interpolation methods preserve image quality during resampling
+  interpolator: sitkLinear  # Linear for images (smooth gradients)
+  # Note: Mask uses sitkNearestNeighbor (handled in resample_pair function)
+  
+  # STEP 5: CONSISTENT MASK AND CROPPING POLICY
+  correctMask: true   # Ensures mask aligns with resampled image grid
+  preCrop: true       # Crops to ROI bounding box, eliminates contextual variation
+  
+  # STEP 3: INTENSITY NORMALIZATION
+  # Z-score normalization for MRI creates consistent statistical distributions
+  normalize: true           # Mean=0, Std=1 within ROI (MRI only)
+  normalizeScale: 100       # Optional scaling factor post-normalization
+  
+  # STEP 6: GRAY-LEVEL DISCRETIZATION
+  # Fixed bin count for MRI after normalization ensures equalized histogram
+  # resolution across subjects. For CT, use binWidth=25 instead to preserve HU.
+  binCount: 64              # 64 gray levels for MRI texture matrices
+  
+  # Reduce diagnostic clutter in output
+  additionalInfo: false
+
+# =============================================================================
+# IMAGE TYPES: MULTI-SCALE FEATURE EXTRACTION
+# =============================================================================
+# Extract features from multiple filtered versions of the image to capture
+# features at different spatial scales
+imageType:
+  Original: {}                          # Raw voxel intensities
+  LoG:                                  # Laplacian of Gaussian (edge/blob detection)
+    sigma: [1.0, 2.0, 3.0]              # Multiple scales (mm)
+  Wavelet: {}                           # Multi-resolution decomposition
+
+# =============================================================================
+# FEATURE CLASSES: TEXTURE AND INTENSITY METRICS
+# =============================================================================
+# Specify which radiomic feature families to compute
+featureClass:
+  firstorder: []   # Intensity histogram features (mean, variance, skewness, etc.)
+  glcm: []         # Gray-Level Co-occurrence Matrix (texture homogeneity, contrast)
+  glrlm: []        # Gray-Level Run-Length Matrix (runs of same intensity)
+  glszm: []        # Gray-Level Size-Zone Matrix (zone sizes)
+  gldm: []         # Gray-Level Dependence Matrix (neighborhood dependencies)
+  ngtdm: []        # Neighborhood Gray-Tone Difference Matrix (coarseness)

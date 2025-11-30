@@ -1,0 +1,29 @@
+setting:
+  # Resampling & interpolation (image only; mask = always nearest neighbor)
+  resampledPixelSpacing: [1.5, 1.5, 1.5]
+  interpolator: 'sitkBSpline'
+
+  # MRI intensity handling
+  normalize: true
+  normalizeScale: 1
+
+  # Discretization
+  binWidth: 10
+
+  # ROI / misc
+  label: 1
+  correctMask: true
+
+imageType:
+  Original: {}
+  LoG: { sigma: [0.5, 1.0, 2.0] }
+  Wavelet: {}
+
+featureClass:
+  firstorder: []
+  shape: []
+  glcm: []
+  glrlm: []
+  glszm: []
+  gldm: []
+  ngtdm: []
