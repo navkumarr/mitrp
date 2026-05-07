@@ -1,0 +1,40 @@
+# =============================================================================
+# CT-specific PyRadiomics configuration for gender classification
+# =============================================================================
+# Based on pyrads.yaml but uses binWidth (not binCount) to preserve
+# Hounsfield Unit semantics in texture feature discretization.
+# =============================================================================
+
+setting:
+  # Spatial resampling – isotropic 1x1x1 mm
+  resampledPixelSpacing: [1.0, 1.0, 1.0]
+  interpolator: sitkLinear
+
+  # Mask policy
+  correctMask: true
+  preCrop: true
+  label: 1
+
+  # CT does not need z-score normalization (HU is already standardized)
+  normalize: false
+
+  # Gray-level discretization – fixed bin width preserves HU meaning
+  binWidth: 25
+
+  # Reduce diagnostic clutter
+  additionalInfo: false
+
+imageType:
+  Original: {}
+  LoG:
+    sigma: [1.0, 2.0, 3.0]
+  Wavelet: {}
+
+featureClass:
+  firstorder: []
+  shape: []
+  glcm: []
+  glrlm: []
+  glszm: []
+  gldm: []
+  ngtdm: []

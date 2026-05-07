@@ -1,5 +1,10 @@
-/mitrpENV
-*.nii.gz
-*.nii
-!/example.nii.gz
-!/example.nii
+CT/
+models/
+figures/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+feature_selection.log
+package-lock.json
+plan.md

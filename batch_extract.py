@@ -1,65 +1,55 @@
 #!/usr/bin/env python3
 """
-Batch Radiomics Feature Extraction
+Batch Radiomics Feature Extraction — All 117 TotalSegmentator Organs
 
 Scans a folder of NIfTI CT volumes, runs TotalSegmentator to produce
-pelvis segmentation masks (hip_left, hip_right, sacrum), extracts
-radiomics features from the combined pelvis region, and optionally
-merges with labels from a CSV.
+all 117 organ masks, then extracts radiomics features from each organ
+individually using PyRadiomics (Original + LoG + Wavelet ≈ 1,130
+features per organ).
 
-Each .nii.gz file in the folder is treated as one subject. The subject
-ID is derived from the filename (e.g. PETCT_06a46414eb.nii.gz ->
-subject_id = PETCT_06a46414eb).
+Output: CT/organ_features/<organ_name>.csv  (one CSV per organ,
+        rows = subjects, columns = features)
+
+Supports checkpointing — if interrupted, re-run the same command
+and it will skip already-completed (subject, organ) pairs.
 
 Usage:
     python batch_extract.py CT/scans
     python batch_extract.py CT/scans --labels CT/First30.csv
-    python batch_extract.py CT/scans --output results.csv --config pyradiomics/pyrads.yaml
-
-Output: CT/radiomics_features.csv  (one row per scan, columns = features + labels)
 """
-import argparse, os, sys, glob, subprocess, tempfile, shutil, time
+import argparse, os, sys, glob, subprocess, tempfile, shutil, time, json, logging
 import pandas as pd
+import numpy as np
 import SimpleITK as sitk
 from radiomics import featureextractor
+
+# Suppress verbose PyRadiomics / SimpleITK logging
+logging.getLogger("radiomics").setLevel(logging.ERROR)
+logging.getLogger("radiomics.glcm").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(BASE_DIR, "pyradiomics", "ct_config.yaml")
-DEFAULT_OUTPUT = os.path.join(BASE_DIR, "CT", "radiomics_features.csv")
+DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "CT", "organ_features")
 VENV_BIN = os.path.join(BASE_DIR, "mitrpENV", "bin")
 
-# Pelvis ROIs for gender classification (strongest skeletal sexual dimorphism)
-PELVIS_ROIS = ["hip_left", "hip_right", "sacrum"]
+# Import preprocessing functions from pyradiomics package
+from pyradiomics.extract_radiomics import to_lps, clamp_ct_hu
 
-# Import preprocessing functions from existing pipeline
-sys.path.insert(0, os.path.join(BASE_DIR, "pyradiomics"))
-from extract_radiomics import to_lps, clamp_ct_hu
 
 # ---------------------------------------------------------------------------
-# TotalSegmentator segmentation
+# TotalSegmentator — all 117 organs
 # ---------------------------------------------------------------------------
 def run_totalsegmentator(ct_path, seg_dir):
     """
-    Run TotalSegmentator on a CT volume to produce pelvis organ masks.
-
-    Uses --roi_subset to only segment hip_left, hip_right, and sacrum,
-    which is faster than segmenting all 104 classes. Uses --fast (3mm)
-    for speed since we only need the mask geometry, not sub-millimetre
-    precision.
-
-    Output: seg_dir/{hip_left,hip_right,sacrum}.nii.gz
+    Run TotalSegmentator on a CT volume with all 117 default organs.
+    Uses --fast (3mm model) for speed.
+    Output: seg_dir/<organ_name>.nii.gz  for each organ
     """
     ts_bin = os.path.join(VENV_BIN, "TotalSegmentator")
-    cmd = [
-        ts_bin,
-        "-i", ct_path,
-        "-o", seg_dir,
-        "--fast",
-        "--roi_subset", *PELVIS_ROIS,
-    ]
+    cmd = [ts_bin, "-i", ct_path, "-o", seg_dir, "--fast"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
@@ -67,73 +57,68 @@ def run_totalsegmentator(ct_path, seg_dir):
         )
 
 
-def merge_masks(seg_dir, rois, out_path):
-    """
-    Merge multiple binary organ masks into a single binary mask.
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+def progress_dir(output_dir):
+    d = os.path.join(output_dir, ".progress")
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    Reads each ROI NIfTI from seg_dir, ORs them together, and writes
-    a combined binary mask. This gives PyRadiomics one contiguous pelvic
-    region to extract features from.
-    """
-    combined = None
-    for roi in rois:
-        roi_path = os.path.join(seg_dir, f"{roi}.nii.gz")
-        if not os.path.isfile(roi_path):
-            continue
-        mask = sitk.ReadImage(roi_path)
-        binary = sitk.BinaryThreshold(mask, lowerThreshold=1, upperThreshold=255,
-                                      insideValue=1, outsideValue=0)
-        binary = sitk.Cast(binary, sitk.sitkUInt8)
-        if combined is None:
-            combined = binary
-        else:
-            combined = sitk.Or(combined, binary)
 
-    if combined is None:
-        raise RuntimeError(f"No pelvis ROI masks found in {seg_dir}")
+def is_done(output_dir, scan_id, organ):
+    marker = os.path.join(progress_dir(output_dir), f"{scan_id}__{organ}.done")
+    return os.path.isfile(marker)
 
-    sitk.WriteImage(combined, out_path, True)
-    return out_path
+
+def mark_done(output_dir, scan_id, organ):
+    marker = os.path.join(progress_dir(output_dir), f"{scan_id}__{organ}.done")
+    with open(marker, "w") as f:
+        f.write("")
 
 
 # ---------------------------------------------------------------------------
-# Per-scan extraction
+# Preprocessing (once per subject)
 # ---------------------------------------------------------------------------
-def extract_scan(scan_id, ct_path, config_yaml, tmp_dir):
-    """
-    Run the full pipeline on one CT scan:
-      1. Run TotalSegmentator for pelvis segmentation
-      2. Merge pelvis masks into one binary mask
-      3. Orient CT to LPS
-      4. Clamp HU
-      5. Extract radiomics features (PyRadiomics handles resampling internally)
-    Returns a dict of {feature_name: value}.
-    """
-    seg_dir = os.path.join(tmp_dir, "segs")
-    os.makedirs(seg_dir, exist_ok=True)
-
-    # Step 1 – TotalSegmentator pelvis segmentation
-    run_totalsegmentator(ct_path, seg_dir)
-
-    # Step 2 – merge hip_left + hip_right + sacrum into one mask
-    mask_path = os.path.join(tmp_dir, "pelvis_mask.nii.gz")
-    merge_masks(seg_dir, PELVIS_ROIS, mask_path)
-
-    # Step 3 – orient to LPS
+def preprocess_ct(ct_path, tmp_dir):
+    """Orient to LPS and clamp HU. Returns path to preprocessed image."""
     img_lps = os.path.join(tmp_dir, "img_lps.nii.gz")
-    mask_lps = os.path.join(tmp_dir, "mask_lps.nii.gz")
     to_lps(ct_path, img_lps)
-    to_lps(mask_path, mask_lps)
-
-    # Step 4 – HU clamping
     img_clamped = os.path.join(tmp_dir, "img_clamped.nii.gz")
     clamp_ct_hu(img_lps, img_clamped)
+    return img_clamped
 
-    # Step 5 – extract features
+
+# ---------------------------------------------------------------------------
+# Per-organ feature extraction
+# ---------------------------------------------------------------------------
+def extract_organ(img_path, mask_path, config_yaml, tmp_dir):
+    """
+    Extract radiomics features for a single organ mask.
+    Returns dict of {feature_name: value} or None if mask is empty.
+    """
+    # Orient mask to LPS to match the preprocessed image
+    mask_lps = os.path.join(tmp_dir, "mask_lps.nii.gz")
+    to_lps(mask_path, mask_lps)
+
+    # Check mask is not empty
+    mask_img = sitk.ReadImage(mask_lps)
+    mask_arr = sitk.GetArrayFromImage(mask_img)
+    if mask_arr.max() == 0:
+        return None
+
+    # Binarize (some TotalSegmentator masks may have values > 1)
+    mask_bin = sitk.BinaryThreshold(mask_img, lowerThreshold=1,
+                                     upperThreshold=255,
+                                     insideValue=1, outsideValue=0)
+    mask_bin = sitk.Cast(mask_bin, sitk.sitkUInt8)
+    mask_bin_path = os.path.join(tmp_dir, "mask_bin.nii.gz")
+    sitk.WriteImage(mask_bin, mask_bin_path, True)
+
     extractor = featureextractor.RadiomicsFeatureExtractor(config_yaml)
-    result = extractor.execute(img_clamped, mask_lps)
+    result = extractor.execute(img_path, mask_bin_path)
 
-    feats = {"subject_id": scan_id}
+    feats = {}
     for k, v in result.items():
         if k.startswith("diagnostics_"):
             continue
@@ -145,29 +130,48 @@ def extract_scan(scan_id, ct_path, config_yaml, tmp_dir):
 
 
 # ---------------------------------------------------------------------------
+# Accumulate results into per-organ CSVs
+# ---------------------------------------------------------------------------
+def save_organ_row(output_dir, organ, scan_id, feats):
+    """Append one subject's features to the organ's CSV file."""
+    csv_path = os.path.join(output_dir, f"{organ}.csv")
+    row = {"subject_id": scan_id, **feats}
+    row_df = pd.DataFrame([row])
+
+    if os.path.isfile(csv_path):
+        existing = pd.read_csv(csv_path)
+        # Avoid duplicate rows on re-run
+        if scan_id in existing["subject_id"].values:
+            return
+        combined = pd.concat([existing, row_df], ignore_index=True)
+    else:
+        combined = row_df
+
+    combined.to_csv(csv_path, index=False)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(
-        description="Batch TotalSegmentator + PyRadiomics feature extraction"
+        description="Batch 117-organ radiomics extraction (Original + LoG + Wavelet)"
     )
     p.add_argument(
         "folder",
-        help="Folder containing .nii.gz CT scans (one file per subject, "
-             "filename used as subject ID)",
+        help="Folder containing .nii.gz CT scans (filename = subject ID)",
     )
     p.add_argument(
         "--labels", default=None,
-        help="CSV with clinical labels (must have 'Subject ID' column). "
-             "If provided, features are merged with labels in the output.",
+        help="CSV with clinical labels (must have 'Subject ID' column)",
     )
     p.add_argument(
         "--config", default=DEFAULT_CONFIG,
-        help=f"Path to PyRadiomics YAML config (default: {DEFAULT_CONFIG})",
+        help=f"PyRadiomics YAML config (default: {DEFAULT_CONFIG})",
     )
     p.add_argument(
-        "--output", default=DEFAULT_OUTPUT,
-        help=f"Output CSV path (default: {DEFAULT_OUTPUT})",
+        "--output-dir", default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory for per-organ CSVs (default: {DEFAULT_OUTPUT_DIR})",
     )
     args = p.parse_args()
 
@@ -175,70 +179,150 @@ def main():
         print(f"ERROR: {args.folder} is not a directory", flush=True)
         sys.exit(1)
 
-    # Discover scans: every .nii.gz in the folder is one subject
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Discover scans
     nifti_files = sorted(glob.glob(os.path.join(args.folder, "*.nii.gz")))
     scans = []
     for f in nifti_files:
-        basename = os.path.basename(f)
-        # Strip .nii.gz to get subject ID
-        scan_id = basename.replace(".nii.gz", "")
+        scan_id = os.path.basename(f).replace(".nii.gz", "")
         scans.append((scan_id, f))
 
     print(f"Found {len(scans)} scans in {args.folder}", flush=True)
-    print(f"Pelvis ROIs: {', '.join(PELVIS_ROIS)}", flush=True)
-
     if not scans:
         print("No .nii.gz files found. Nothing to do.", flush=True)
         sys.exit(0)
 
-    # Load labels if provided
-    labels_df = None
+    # Persistent cache directories (survive Ctrl+C restarts)
+    seg_cache = os.path.join(args.output_dir, ".segs")
+    preproc_cache = os.path.join(args.output_dir, ".preproc")
+    os.makedirs(seg_cache, exist_ok=True)
+    os.makedirs(preproc_cache, exist_ok=True)
+
+    # Process each subject
+    total_t0 = time.time()
+    for i, (scan_id, ct_path) in enumerate(scans):
+        print(f"\n{'='*60}", flush=True)
+        print(f"[{i+1}/{len(scans)}] Subject: {scan_id}", flush=True)
+        print(f"{'='*60}", flush=True)
+        subj_t0 = time.time()
+
+        # Check if ALL organs are already done for this subject
+        all_done = True
+        for organ_name_check in glob.glob(os.path.join(seg_cache, scan_id, "*.nii.gz")):
+            pass  # just need to check progress markers
+        # Quick check: if we have 117 .done markers for this subject, skip entirely
+        done_markers = glob.glob(
+            os.path.join(progress_dir(args.output_dir), f"{scan_id}__*.done")
+        )
+        if len(done_markers) >= 117:
+            print("  All organs already done, skipping.", flush=True)
+            continue
+
+        try:
+            # --- Step 1: TotalSegmentator (cached) ---
+            subj_seg_dir = os.path.join(seg_cache, scan_id)
+            if os.path.isdir(subj_seg_dir) and len(
+                glob.glob(os.path.join(subj_seg_dir, "*.nii.gz"))
+            ) >= 100:
+                print("  Using cached segmentation masks.", flush=True)
+            else:
+                os.makedirs(subj_seg_dir, exist_ok=True)
+                print("  Running TotalSegmentator (all organs) ...", flush=True)
+                ts_t0 = time.time()
+                run_totalsegmentator(ct_path, subj_seg_dir)
+                print(f"  TotalSegmentator done ({time.time()-ts_t0:.0f}s)",
+                      flush=True)
+
+            # --- Step 2: Preprocess CT (cached) ---
+            img_preprocessed = os.path.join(preproc_cache, f"{scan_id}.nii.gz")
+            if os.path.isfile(img_preprocessed):
+                print("  Using cached preprocessed CT.", flush=True)
+            else:
+                print("  Preprocessing CT (LPS + HU clamp) ...", flush=True)
+                preprocess_ct(ct_path, preproc_cache)
+                # preprocess_ct writes to img_clamped in the dir; rename
+                tmp_clamped = os.path.join(preproc_cache, "img_clamped.nii.gz")
+                os.rename(tmp_clamped, img_preprocessed)
+                # Clean up intermediate LPS file
+                tmp_lps = os.path.join(preproc_cache, "img_lps.nii.gz")
+                if os.path.isfile(tmp_lps):
+                    os.remove(tmp_lps)
+
+            # --- Step 3: Extract features for each organ ---
+            mask_files = sorted(
+                glob.glob(os.path.join(subj_seg_dir, "*.nii.gz"))
+            )
+            print(f"  Found {len(mask_files)} organ masks", flush=True)
+
+            for j, mask_path in enumerate(mask_files):
+                organ = os.path.basename(mask_path).replace(".nii.gz", "")
+
+                # Skip if already done (checkpoint)
+                if is_done(args.output_dir, scan_id, organ):
+                    continue
+
+                organ_t0 = time.time()
+                print(f"    [{j+1}/{len(mask_files)}] {organ} ...",
+                      end="", flush=True)
+
+                organ_tmp = tempfile.mkdtemp(prefix=f"organ_{organ}_")
+                try:
+                    feats = extract_organ(
+                        img_preprocessed, mask_path,
+                        args.config, organ_tmp
+                    )
+
+                    if feats is None:
+                        print(f" EMPTY mask, skipped ({time.time()-organ_t0:.0f}s)",
+                              flush=True)
+                    else:
+                        save_organ_row(args.output_dir, organ, scan_id, feats)
+                        print(f" {len(feats)} features ({time.time()-organ_t0:.0f}s)",
+                              flush=True)
+
+                    mark_done(args.output_dir, scan_id, organ)
+
+                except Exception as e:
+                    print(f" ERROR: {e}", flush=True)
+
+                finally:
+                    shutil.rmtree(organ_tmp, ignore_errors=True)
+
+        except Exception as e:
+            print(f"  SUBJECT ERROR: {e}", flush=True)
+
+        elapsed = time.time() - subj_t0
+        print(f"  Subject done in {elapsed/60:.1f} min", flush=True)
+
+    total_elapsed = time.time() - total_t0
+    print(f"\nAll done. Total time: {total_elapsed/60:.1f} min", flush=True)
+
+    # --- Merge labels into each organ CSV if provided ---
     if args.labels and os.path.isfile(args.labels):
+        print(f"\nMerging labels from {args.labels} ...", flush=True)
         labels_df = pd.read_csv(args.labels)
         if "Subject ID" in labels_df.columns:
             labels_df.rename(columns={"Subject ID": "subject_id"}, inplace=True)
         labels_df = labels_df.drop_duplicates(subset="subject_id")
-        print(f"Loaded {len(labels_df)} labels from {args.labels}", flush=True)
+        label_cols = ["subject_id", "sex", "age", "diagnosis"]
+        labels_df = labels_df[[c for c in label_cols if c in labels_df.columns]]
 
-    # Process each scan
-    all_features = []
-    for i, (scan_id, ct_path) in enumerate(scans):
-        print(f"  [{i+1}/{len(scans)}] Processing {scan_id} ...", flush=True)
-        t0 = time.time()
+        organ_csvs = glob.glob(os.path.join(args.output_dir, "*.csv"))
+        for csv_path in organ_csvs:
+            df = pd.read_csv(csv_path)
+            if "sex" in df.columns:
+                continue  # already merged
+            df = df.merge(labels_df, on="subject_id", how="left")
+            # Move label cols to front
+            lcols = [c for c in label_cols if c in df.columns]
+            fcols = [c for c in df.columns if c not in lcols]
+            df = df[lcols + fcols]
+            df.to_csv(csv_path, index=False)
 
-        tmp_dir = tempfile.mkdtemp(prefix=f"rads_{scan_id}_")
-        try:
-            feats = extract_scan(scan_id, ct_path, args.config, tmp_dir)
-            all_features.append(feats)
-            elapsed = time.time() - t0
-            print(f"    -> {len(feats) - 1} features extracted ({elapsed:.0f}s)", flush=True)
-        except Exception as e:
-            print(f"    -> ERROR: {e}", flush=True)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"Labels merged into {len(organ_csvs)} organ CSVs", flush=True)
 
-    if not all_features:
-        print("No features extracted. Exiting.", flush=True)
-        sys.exit(1)
-
-    # Build dataframe
-    feat_df = pd.DataFrame(all_features)
-
-    # Merge with labels if available
-    if labels_df is not None:
-        feat_df = feat_df.merge(labels_df, on="subject_id", how="left")
-        # Move label columns to the front
-        label_cols = [c for c in labels_df.columns if c in feat_df.columns]
-        feature_cols = [c for c in feat_df.columns if c not in label_cols]
-        feat_df = feat_df[label_cols + feature_cols]
-        n_features = len(feature_cols)
-    else:
-        n_features = len(feat_df.columns) - 1  # minus subject_id
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    feat_df.to_csv(args.output, index=False)
-    print(f"\nSaved {len(feat_df)} rows x {n_features} features -> {args.output}",
-          flush=True)
+    print(f"\nOutput directory: {args.output_dir}/", flush=True)
 
 
 if __name__ == "__main__":

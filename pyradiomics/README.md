@@ -3,7 +3,7 @@
 ## GLCM — Gray Level Co-occurrence Matrix  
 → Contrast, Correlation, Homogeneity, JointEntropy  
 
-* GLCM's main function is to loo at how pairs of gray levels occuer at a defined spacial relationship, essentially just comparing the distance and angle of certain grays using different measures.  
+* GLCM's main function is to low at how pairs of gray levels occuer at a defined spacial relationship, essentially just comparing the distance and angle of certain grays using different measures.  
 * Notably, high entropy + high contrast usually inidcates heterogeneous tissue like tumors or fibrosis, while high homogeneity represents more uniform tissue.  
 
 ---

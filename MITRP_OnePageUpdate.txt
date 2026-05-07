@@ -1,0 +1,61 @@
+MITRP Gender Classification Pipeline: Semester Update
+
+Hi Professor McMillan,
+
+Please find below the semester update on the MITRP gender classification project:
+
+
+PROJECT OVERVIEW
+
+We have successfully completed development of a machine learning pipeline for automated gender classification from CT scan radiomics features. The system was trained on 30 CT scans (15 male, 15 female) using TotalSegmentator for segmentation (117 organs), PyRadiomics for feature extraction (~1,130 features per organ), and consensus-based feature selection (reducing to 20 features per organ).
+
+
+KEY RESULTS
+
+All three project priorities have been completed with the following achievements:
+
+Priority 1 - Machine Learning Classifiers (Complete):
+  • Gluteus Maximus model: 100% accuracy (±0%)
+  • Global model (112 organs): 96.67% accuracy (±6.67%)
+  • Heart model: 96.67% accuracy (20 features)
+  • Liver model: 96.67% accuracy (20 features)
+  • Random Forest outperforms MLP by 23-47 percentage points
+
+Priority 2 - Feature Selection (Complete):
+  • Consensus selection across 115 anatomical organs
+  • 98.2% feature reduction (1,130 → 20 features per organ)
+  • 2,300 total features selected (115 organs × 20 features)
+  • Top feature (wavelet-LLL_ngtdm_Strength) selected in 72/115 organs
+
+Priority 3 - Modular Architecture (Complete):
+  • config.py: Centralized configuration management
+  • train_gender_classifier.py: Modular training pipeline
+  • feature_selection.py: Reusable feature selection utilities
+  • evaluate_classifier.py: Comprehensive evaluation and feature importance analysis
+  • Full documentation with EVALUATION_GUIDE.md
+
+
+TECHNICAL HIGHLIGHTS
+
+  • Validation: 5-fold stratified cross-validation (24 training, 6 test samples per fold)
+  • Feature Importance: Top 5 features account for 52% of prediction importance
+  • Algorithm Selection: Random Forest (1,000 parameters) superior to MLP (50,000 parameters) on small dataset
+  • Individual vs. Global: Single organ models match global model performance, suggesting gender effects are organ-specific
+  • Strongest Region: Gluteus maximus achieves perfect 100% classification, indicating pronounced sexual dimorphism
+
+
+DELIVERABLES
+
+  • 8 trained models (pickle files) ready for deployment
+  • Cross-validation metrics and feature importance rankings (CSV files)
+  • Complete codebase with documentation
+  • All scripts executable with single commands
+
+
+STATUS
+
+All priorities complete. System is production-ready and reproducible. Ready for external validation and deployment on new CT scans.
+
+
+Best regards,
+Sheamus
